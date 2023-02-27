@@ -5,11 +5,22 @@
 # Science and Conservation Branch
 # Royal Botanic Gardens, Sydney
 #
+
+# 20 July 2020: Changed handling of spatial objects to use library sf; fixed
+# small bug in "on-click" event handler: clicking outside bounds for a selected
+# taxon repeatedly no longer causes alternate on- & off-display of 'out of
+# bounds' alert; made 'out of bounds' alert more prominent by changing background
+# colour and text stylings
 # 26 May 2016; 17 June 2018: Added progress notifications;
 # 6 December 2018: Refined a number of UI elements
 # 5-7 August 2019: Serious revision to expand the range of environmental variables for
 # computing matching environment layers; changes also to calling of functions in a heavily
-# re-designed RandR.modelReview2 R-package.
+# re-designed RandR.modelReview R-package.
+# 1-8 June 2020: Enhanced by adding spinners, allowing user to select GDM
+# threshold but also to allow resetting to the default value stored in the GDM
+# object, and updating of help modal dialogs.
+# 25 July 2020: Made into a fuly standalone application by incorporating functions
+# from the R-package RandR.modelReview
 #
 # The method to deal with empty dataframes so that clearMarkers() and addCircleMarkers() work
 # properly comes from a reply by Joe Cheng (RStudio) to a post by Catherine Smith. See:
@@ -24,53 +35,616 @@
 #   http://stackoverflow.com/questions/37523323/identify-position-of-a-click-on-a-raster-in-leaflet-in-r?noredirect=1&lq=1
 # last accessed 25 October 2016
 #
-# Checkbox group multicoumn CSS code from:
+# Checkbox group multicolumn CSS code from:
 #   https://stackoverflow.com/questions/42742191/align-checkboxgroupinput-vertically-and-horizontally
 # last accessed 25 August 2019
+#
 
 library(shiny)
+library(shinybusy)
+library(shinyjs)
+library(shinyBS)
+#library(shinyRGL)
 library(leaflet)
-#library(RColorBrewer)
-library(rgdal)
+library(sf)
 library(raster)
-library(RandR.modelReview)
+#library(rasterVis)
 library(jsonlite)
 library(RSQLite)
+library(gdm)
+#library(rgl)
 
 # Initialise stuff
 markerPalette <- c("red","orange","lightskyblue","lightgreen")
-#markerPalette <- brewer.pal(9,"Set1")[c(1,5,4,3)]
-#layerPalette <- c("#666666","#FF83FA", "#3366ff")
 
 ### layer ordering: local genetic region, current climate match, future climate match, domain, transition zones
 layerPalette <- c("#666666", "#3366ff","#F57900", "#adff2f", "#9b30ff")
 
 envFolder <- ""
 
-modelFolder <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/models/gdm/"
+basePath <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/"
 
-boundsFolder <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/models/domain"
+modelFolder <- paste0(basePath, "models/gdm/")
 
-zonesFolder <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/models/zones"
+boundsFolder <- paste0(basePath, "models/domain")
+
+zonesFolder <- paste0(basePath, "models/zones")
 
 sqlPath <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/Databasing/RandR-sqlite-db/RandR_sampling.sqlite"
 
 basePathOcc <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_KML/"
 
-modelList <- list.files(modelFolder, "*.Rd") #, full.names = TRUE)
-#print(modelList)
-
-basePath <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/"
+modelList <- list.files(modelFolder, "*.Rd")
 
 zonesList <- list.files(zonesFolder, "*.geojson")
-
-# taxon_Name <- unlist(lapply(strsplit(modelList, "_genetic_model",  fixed = TRUE), function(el){el[1]}))
-# names(taxon_Name) <- modelList
 
 modelListDisplay <- c("No model selected", sort(gsub(".Rd$","",basename(modelList), fixed = TRUE)))
 
 boundsPoly <- NULL
 
+load(paste0(basePath,"resources/sysdata.rda"))
+
+
+###############################################################################
+############# Support functions from package RandR.modelReview ################
+###############################################################################
+RandR_currentSiteMatch <- function(longitude, latitude, envVars = NULL)
+{
+  if (is.null(envVars) | !any(c("MAT", "MAP", "TS", "PS", "TWI", "Aspect") %in% envVars))
+    return(NULL)
+  else
+  {
+    sessionDir <- tempdir()
+    
+    thres <- 0
+    
+    MAT_tol <- 1.25
+    MAT_min <- min(MAT_vals, na.rm = TRUE)
+    MAT_max <- max(MAT_vals, na.rm = TRUE)
+    
+    MAP_tol <- 300 #150
+    MAP_min <- min(MAP_vals, na.rm = TRUE)
+    MAP_max <- max(MAP_vals, na.rm = TRUE)
+    
+    TS_tol <- 0.5
+    TS_min <- min(TS_vals, na.rm = TRUE)
+    TS_max <- max(TS_vals, na.rm = TRUE)
+    
+    PS_tol <- 5
+    PS_min <- min(PS_vals, na.rm = TRUE)
+    PS_max <- max(PS_vals, na.rm = TRUE)
+    
+    aspect_tol <- 45
+    aspect_min <- min(aspect_vals, na.rm = TRUE)
+    aspect_max <- max(aspect_vals, na.rm = TRUE)
+    
+    TWI_tol <- 2
+    TWI_min <- min(TWI_vals, na.rm = TRUE)
+    TWI_max <- max(TWI_vals, na.rm = TRUE)
+    
+    cellNum <- raster::cellFromXY(baseRas, cbind(longitude, latitude))
+    
+    sum_vals <- rep(0, length(MAT_vals))
+    
+    #print(envVars)
+    
+    if ("MAT" %in% envVars)
+    {
+      MAT_pt <- MAT_vals[cellNum]
+      MAT_upper <- pmax(MAT_min, pmin(MAT_pt + MAT_tol, MAT_max))
+      MAT_lower <- pmax(MAT_min, pmin(MAT_pt - MAT_tol, MAT_max))
+      sum_vals <- sum_vals + .bincode(MAT_vals, c(MAT_lower, MAT_upper))
+      thres <- thres + 1
+      #cat("Mean Ann. Temp.: threshold =", thres, "\n")
+    }
+    
+    if ("MAP" %in% envVars)
+    {
+      MAP_pt <- MAP_vals[cellNum]
+      MAP_upper <- pmax(MAP_min, pmin(MAP_pt + MAP_tol, MAP_max))
+      MAP_lower <- pmax(MAP_min, pmin(MAP_pt - MAP_tol, MAP_max))
+      sum_vals <- sum_vals + .bincode(MAP_vals, c(MAP_lower, MAP_upper))
+      thres <- thres + 1
+      #cat("Mean Ann. Temp.: threshold =", thres, "\n")
+    }
+    
+    if ("TS" %in% envVars)
+    {
+      TS_pt <- TS_vals[cellNum]
+      TS_upper <- pmax(TS_min, pmin(TS_pt + TS_tol, TS_max))
+      TS_lower <- pmax(TS_min, pmin(TS_pt - TS_tol, TS_max))
+      sum_vals <- sum_vals + .bincode(TS_vals, c(TS_lower, TS_upper))
+      thres <- thres + 1
+    }
+    
+    if ("PS" %in% envVars)
+    {
+      PS_pt <- PS_vals [cellNum]
+      PS_upper <- pmax(PS_min, pmin(PS_pt + PS_tol, PS_max))
+      PS_lower <- pmax(PS_min, pmin(PS_pt - PS_tol, PS_max))
+      sum_vals <- sum_vals + .bincode(PS_vals, c(PS_lower, PS_upper))
+      thres <- thres + 1
+    }
+    
+    if ("Aspect" %in% envVars)
+    {
+      aspect_pt <- aspect_vals[cellNum]
+      aspect_upper <- pmax(aspect_min, pmin(aspect_pt + aspect_tol, aspect_max))
+      aspect_lower <- pmax(aspect_min, pmin(aspect_pt - aspect_tol, aspect_max))
+      sum_vals <- sum_vals + .bincode(aspect_vals, c(aspect_lower, aspect_upper))
+      thres <- thres + 1
+    }
+    
+    if ("TWI" %in% envVars)
+    {
+      TWI_pt <- TWI_vals[cellNum]
+      TWI_upper <- pmax(TWI_min, pmin(TWI_pt + TWI_tol, TWI_max))
+      TWI_lower <- pmax(TWI_min, pmin(TWI_pt - TWI_tol, TWI_max))
+      sum_vals <- sum_vals + .bincode(TWI_vals, c(TWI_lower, TWI_upper))
+      thres <- thres + 1
+    }
+    
+    #####################
+    ras_sum <- baseRas
+    raster::values(ras_sum) <- ifelse(sum_vals == thres, 1, NA)
+    pathToRasFile <- paste0(sessionDir,"/matchedSite_Current.tif")
+    raster::writeRaster(ras_sum, pathToRasFile, overwrite = TRUE)
+    RandR_gdal_polygonizeR(pathToRasFile, sessionDir)
+    
+    geoJsonName <- paste0(sessionDir, "/matchedSite_Current.geojson")
+    
+    return(jsonlite::toJSON(jsonlite::fromJSON(txt = geoJsonName), auto_unbox = TRUE))
+  }
+}
+
+
+###############################################################################
+RandR_futureSiteMatch <- function(longitude, latitude, envVars, rcp, epoch)
+{
+  if (is.null(envVars) | !any(c("MAT", "MAP", "TS", "PS", "TWI", "Aspect") %in% envVars))
+    return(NULL)
+  else
+  {
+    sessionDir <- tempdir()
+    
+    thres <- 0
+    
+    MAT_tol <- 1.25
+    
+    MAP_tol <- 300 #150
+    
+    TS_tol <- 0.5
+    
+    PS_tol <- 5
+    PS_min <- min(PS_vals, na.rm = TRUE)
+    PS_max <- max(PS_vals, na.rm = TRUE)
+    
+    aspect_tol <- 45
+    aspect_min <- min(aspect_vals, na.rm = TRUE)
+    aspect_max <- max(aspect_vals, na.rm = TRUE)
+    
+    TWI_tol <- 2
+    TWI_min <- min(TWI_vals, na.rm = TRUE)
+    TWI_max <- max(TWI_vals, na.rm = TRUE)
+    
+    cellNum <- raster::cellFromXY(baseRas, cbind(longitude, latitude))
+    
+    sum_vals <- rep(0, length(MAT_vals))
+    
+    ##########################
+    if ("MAT" %in% envVars)
+    {
+      MAT_valsFuture <- get(paste0("MAT_vals_", rcp, "_", epoch))
+      MAT_min <- min(MAT_valsFuture, na.rm = TRUE)
+      MAT_max <- max(MAT_valsFuture, na.rm = TRUE)
+      MAT_pt <- MAT_valsFuture[cellNum]
+      MAT_upper <- pmax(MAT_min, pmin(MAT_pt + MAT_tol, MAT_max))
+      MAT_lower <- pmax(MAT_min, pmin(MAT_pt - MAT_tol, MAT_max))
+      sum_vals <- sum_vals + .bincode(MAT_vals, c(MAT_lower, MAT_upper))
+      thres <- thres + 1
+    }
+    
+    ##########################
+    if ("MAP" %in% envVars)
+    {
+      MAP_valsFuture <- get(paste0("MAP_vals_", rcp, "_", epoch))
+      MAP_min <- min(MAP_valsFuture, na.rm = TRUE)
+      MAP_max <- max(MAP_valsFuture, na.rm = TRUE)
+      MAP_pt <- MAP_valsFuture[cellNum]
+      MAP_upper <- pmax(MAP_min, pmin(MAP_pt + MAP_tol, MAP_max))
+      MAP_lower <- pmax(MAP_min, pmin(MAP_pt - MAP_tol, MAP_max))
+      sum_vals <- sum_vals + .bincode(MAP_vals, c(MAP_lower, MAP_upper))
+      thres <- thres + 1
+    }
+    
+    ##########################
+    if ("TS" %in% envVars)
+    {
+      TS_valsFuture <- get(paste0("TS_vals_", rcp, "_", epoch))
+      TS_min <- min(TS_valsFuture, na.rm = TRUE)
+      TS_max <- max(TS_valsFuture, na.rm = TRUE)
+      TS_pt <- TS_valsFuture[cellNum]
+      TS_upper <- pmax(TS_min, pmin(TS_pt + TS_tol, TS_max))
+      TS_lower <- pmax(TS_min, pmin(TS_pt - TS_tol, TS_max))
+      sum_vals <- sum_vals + .bincode(TS_vals, c(TS_lower, TS_upper))
+      thres <- thres + 1
+    }
+    
+    ##########################
+    if ("PS" %in% envVars)
+    {
+      PS_valsFuture <- get(paste0("PS_vals_", rcp, "_", epoch))
+      PS_min <- min(PS_valsFuture, na.rm = TRUE)
+      PS_max <- max(PS_valsFuture, na.rm = TRUE)
+      PS_pt <- PS_valsFuture[cellNum]
+      PS_upper <- pmax(PS_min, pmin(PS_pt + PS_tol, PS_max))
+      PS_lower <- pmax(PS_min, pmin(PS_pt - PS_tol, PS_max))
+      sum_vals <- sum_vals + .bincode(PS_vals, c(PS_lower, PS_upper))
+      thres <- thres + 1
+    }
+    
+    ##########################
+    if ("Aspect" %in% envVars)
+    {
+      aspect_pt <- aspect_vals[cellNum]
+      aspect_upper <- pmax(aspect_min, pmin(aspect_pt + aspect_tol, aspect_max))
+      aspect_lower <- pmax(aspect_min, pmin(aspect_pt - aspect_tol, aspect_max))
+      sum_vals <- sum_vals + .bincode(aspect_vals, c(aspect_lower, aspect_upper))
+      thres <- thres + 1
+    }
+    
+    ##########################
+    if ("TWI" %in% envVars)
+    {
+      TWI_pt <- TWI_vals[cellNum]
+      TWI_upper <- pmax(TWI_min, pmin(TWI_pt + TWI_tol, TWI_max))
+      TWI_lower <- pmax(TWI_min, pmin(TWI_pt - TWI_tol, TWI_max))
+      sum_vals <- sum_vals + .bincode(TWI_vals, c(TWI_lower, TWI_upper))
+      thres <- thres + 1
+    }
+    
+    ##########################
+    ras_sumFuture <- baseRas
+    raster::values(ras_sumFuture) <- ifelse(sum_vals == thres, 1, NA)
+    pathToRasFile <- paste0(sessionDir, "/matchedClimate_Future.tif")
+    raster::writeRaster(ras_sumFuture, pathToRasFile, overwrite = TRUE)
+    RandR_gdal_polygonizeR(pathToRasFile, sessionDir)
+    
+    geoJsonName <- paste0(sessionDir, "/matchedClimate_Future.geojson")
+    
+    return(jsonlite::toJSON(jsonlite::fromJSON(txt = geoJsonName), auto_unbox = TRUE))
+  }
+}
+
+
+###############################################################################
+RandR_GDM_prediction <- function(longitude,
+                                 latitude,
+                                 taxonName = "",
+                                 modelPath = "",
+                                 secretDumpFile = "",
+                                 threshold = NULL,
+                                 verbose = FALSE)
+{
+  if ((taxonName == "") | (length(taxonName) > 1))
+    stop("taxonName required and cannot be more than one name")
+  
+  if (modelPath == "")
+    stop("modelPath must be given a value")
+  
+  if (!file.exists(modelPath))
+    stop("Filepath given in modelPath cannot be found")
+  
+  if(!is.null(threshold))
+  {
+    if ((!is.numeric(threshold)) | (threshold < 0) | (threshold > 1))
+      stop("threshold must be a numeric value between 0 and 1")
+  }
+  
+  if (verbose) st1 <- Sys.time()
+  sessionDir <- tempdir()
+  taxon_Name <- gsub(" ", "_", taxonName, fixed = TRUE)
+  s1_point <- c(longitude, latitude)
+  
+  load(modelPath)
+  #load(paste0("/var/sftp/randr/gdm/", taxon_Name, "_genetic_model.Rd"))
+  
+  # Patch proj4string:
+  md$confidence_polygon@proj4string <- sp::CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+  
+  if (verbose) st <- Sys.time()
+  goodPtsInd <- which(!is.na(sp::over(baseRas_spdf, md$confidence_polygon)))
+  
+  if (verbose)
+  {
+    cat("    - sp:over() call: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  # Make prediction data frame
+  s2_ll      <- baseRas_spdf@coords[as.numeric(goodPtsInd),]
+  null_dist  <- rep(1, nrow(s2_ll))
+  null_wght  <- rep(1, nrow(s2_ll))
+  
+  s1_ll <- cbind(rep(s1_point[1], nrow(s2_ll)), rep(s1_point[2], nrow(s2_ll)))
+  
+  #gdm_prd   <- cbind(null_dist, null_wght, s1_ll, s2_ll)
+  #colnames(gdm_prd)  <- c("distance", "weights", "s1.xCoord", "s1.yCoord", "s2.xCoord", "s2.yCoord")
+  #gdm_prd   <- as.data.frame(gdm_prd) #### Why is this necesaary?
+  
+  gdm_prd <- data.frame(distance = null_dist,
+                        weights = null_wght,
+                        s1.xCoord = rep(s1_point[1], nrow(s2_ll)),
+                        s1.yCoord = rep(s1_point[2], nrow(s2_ll)),
+                        s2.xCoord = s2_ll[,1],
+                        s2.yCoord = s2_ll[,2])
+  
+  # Add other predictors as indicated by flags in the gdm object
+  if(md$Q)
+  {
+    if (verbose) cat("Has Q\n")
+    qdata <- raster::stack(md$qdata)
+    s1_Q  <- raster::extract(qdata, s1_ll)
+    s2_Q  <- raster::extract(qdata, s2_ll)
+    
+    colnames(s1_Q) <- paste0("s1.Q", 1:ncol(s1_Q))
+    colnames(s2_Q) <- paste0("s2.Q", 1:ncol(s2_Q))
+    
+    gdm_prd   <- cbind(gdm_prd, s1_Q, s2_Q)
+  }
+  
+  if(md$E)
+  {
+    if (verbose) cat("Has E\n")
+    edata  <- raster::stack(md$edata)
+    enames <- names(edata)
+    s1_E  <- raster::extract(edata, s1_ll)
+    s2_E  <- raster::extract(edata, s2_ll)
+    
+    colnames(s1_E) <- paste0("s1.", enames, 1:ncol(s1_E))
+    colnames(s2_E) <- paste0("s2.", enames, 1:ncol(s2_E))
+    
+    gdm_prd   <- cbind(gdm_prd, s1_E, s2_E)
+    
+    # in case environmental variable undefined in parts of srast
+    gdm_prd <- gdm_prd[ rowSums(is.na(gdm_prd)) <= 0, ]
+    s2_ll   <- gdm_prd[, 5:6]
+  }
+  
+  if (verbose)
+  {
+    cat("*** gdm_prd has", nrow(gdm_prd), "rows and", ncol(gdm_prd), "columns\n")
+    cat("    - make gdm-prd: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  
+  finePred <- predict(md$model, gdm_prd)
+  
+  if (any(is.na(finePred)))
+  {
+    cat(crayon::yellow("\n*** WARNING: there are", sum(is.na(finePred)),"cells where the GGM predicition returned 'NA'\n"))
+  }
+  
+  if (secretDumpFile != "")
+  {
+    # Save lat/long values at which the predictions were made so they can be
+    # placed in any raster
+    gdmPrediction <- data.frame(s2_ll, prediction = finePred)
+    save(gdmPrediction, file = secretDumpFile)
+  }
+  
+  if (verbose)
+  {
+    cat("*** Compute prediction: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  predRas <- baseRas
+  
+  if (!is.null(threshold))
+    cellInd <- raster::cellFromXY(predRas, s2_ll[which(finePred <= threshold),])
+  else
+    cellInd <- raster::cellFromXY(predRas, s2_ll[which(finePred <= md$threshold),])
+  
+  raster::values(predRas) <- NA
+  raster::values(predRas)[cellInd] <- 1
+  
+  #### path and file name convention need to be checked and adjusted as necessary
+  outFilename <- paste0(sessionDir, "/", taxon_Name, "_local_genetic.tif")
+  
+  raster::writeRaster(predRas,
+                      outFilename,
+                      format = "GTiff",
+                      overwrite = TRUE)
+  if (verbose)
+  {
+    cat("*** Prepare and save raster: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  RandR_gdal_polygonizeR(outFilename, sessionDir)
+  
+  geoJsonName <- paste0(sessionDir, "/", taxon_Name, "_local_genetic.geojson")
+  
+  if (verbose)
+  {
+    cat("*** Polygon create and save: ")
+    print(Sys.time() - st)
+    cat("\n\n*** Total execution time: ")
+    print(Sys.time() - st1)
+  }
+  
+  return(jsonlite::toJSON(jsonlite::fromJSON(txt = geoJsonName), auto_unbox = TRUE))
+}
+
+
+###############################################################################
+RandR_GDM_prediction_raw <- function(longitude,
+                                     latitude,
+                                     taxonName,
+                                     modelFolder,
+                                     outputFolder,
+                                     verbose = FALSE)
+{
+  if (verbose) st1 <- Sys.time()
+  #sessionDir <- tempdir()
+  
+  if (!dir.exists(outputFolder)) dir.create(outputFolder)
+  
+  taxon_Name <- gsub(" ", "_", taxonName, fixed = TRUE)
+  s1_point <- c(longitude, latitude)
+  
+  load(paste0(modelFolder, "/", taxon_Name, "_genetic_model.Rd"))
+  #load(paste0("/var/sftp/randr/gdm/", taxon_Name, "_genetic_model.Rd"))
+  
+  # Patch proj4string:
+  md$confidence_polygon@proj4string <- sp::CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+  
+  if (verbose) st <- Sys.time()
+  goodPtsInd <- which(!is.na(sp::over(baseRas_spdf, md$confidence_polygon)))
+  
+  if (verbose)
+  {
+    cat("    - sp:over() call: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  # Make prediction data frame
+  s2_ll      <- baseRas_spdf@coords[as.numeric(goodPtsInd),]
+  null_dist  <- rep(1, nrow(s2_ll))
+  null_wght  <- rep(1, nrow(s2_ll))
+  
+  s1_ll <- cbind(rep(s1_point[1], nrow(s2_ll)), rep(s1_point[2], nrow(s2_ll)))
+  
+  #gdm_prd   <- cbind(null_dist, null_wght, s1_ll, s2_ll)
+  #colnames(gdm_prd)  <- c("distance", "weights", "s1.xCoord", "s1.yCoord", "s2.xCoord", "s2.yCoord")
+  #gdm_prd   <- as.data.frame(gdm_prd) #### Why is this necesaary?
+  
+  gdm_prd <- data.frame(distance = null_dist,
+                        weights = null_wght,
+                        s1.xCoord = rep(s1_point[1], nrow(s2_ll)),
+                        s1.yCoord = rep(s1_point[2], nrow(s2_ll)),
+                        s2.xCoord = s2_ll[,1],
+                        s2.yCoord = s2_ll[,2])
+  
+  # Add other predictors as indicated by flags in the gdm object
+  if(md$Q)
+  {
+    if (verbose) cat("Has Q\n")
+    qdata <- raster::stack(md$qdata)
+    s1_Q  <- raster::extract(qdata, s1_ll)
+    s2_Q  <- raster::extract(qdata, s2_ll)
+    
+    colnames(s1_Q) <- paste0("s1.Q", 1:ncol(s1_Q))
+    colnames(s2_Q) <- paste0("s2.Q", 1:ncol(s2_Q))
+    
+    gdm_prd   <- cbind(gdm_prd, s1_Q, s2_Q)
+  }
+  
+  if(md$E)
+  {
+    if (verbose) cat("Has E\n")
+    edata  <- raster::stack(md$edata)
+    enames <- names(edata)
+    s1_E  <- raster::extract(edata, s1_ll)
+    s2_E  <- raster::extract(edata, s2_ll)
+    
+    colnames(s1_E) <- paste0("s1.", enames, 1:ncol(s1_E))
+    colnames(s2_E) <- paste0("s2.", enames, 1:ncol(s2_E))
+    
+    gdm_prd   <- cbind(gdm_prd, s1_E, s2_E)
+    
+    # in case environmental variable undefined in parts of srast
+    gdm_prd <- gdm_prd[ rowSums(is.na(gdm_prd)) <= 0, ]
+    s2_ll   <- gdm_prd[,5:6]
+  }
+  
+  if (verbose)
+  {
+    cat("*** gdm_prd has", nrow(gdm_prd), "rows and", ncol(gdm_prd), "columns\n")
+    cat("    - make gdm-prd: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  finePred <- gdm::predict.gdm(md$model, gdm_prd)
+  if (verbose)
+  {
+    cat("*** Compute prediction: ")
+    print(Sys.time() - st)
+  }
+  
+  if (verbose) st <- Sys.time()
+  predRas <- baseRas
+  
+  cellInd <- raster::cellFromXY(predRas, s2_ll)
+  
+  raster::values(predRas) <- NA
+  raster::values(predRas)[cellInd] <- finePred
+  
+  #### path and file name convention need to be checked and adjusted as necessary
+  outFilename <- paste0(outputFolder, "/", taxon_Name, "_local_genetic_raw.tif")
+  
+  raster::writeRaster(predRas,
+                      outFilename,
+                      format = "GTiff",
+                      overwrite = TRUE)
+  if (verbose)
+  {
+    cat("*** Prepare and save raster: ")
+    print(Sys.time() - st)
+  }
+  
+  # if (verbose) st <- Sys.time()
+  # RandR_gdal_polygonizeR(outFilename, sessionDir)
+  # 
+  # geoJsonName <- paste0(sessionDir, "/", taxon_Name, "_local_genetic")
+  
+  if (verbose)
+  {
+    cat("*** Polygon create and save: ")
+    print(Sys.time() - st)
+    cat("\n\n*** Total execution time: ")
+    print(Sys.time() - st1)
+  }
+  
+  # return(jsonlite::toJSON(jsonlite::fromJSON(txt = geoJsonName), auto_unbox = TRUE))
+  return(outFilename)
+}
+
+
+###############################################################################
+RandR_gdal_polygonizeR <- function(pathToRasFile,
+                                   outDir)
+{
+  pyPath <- Sys.which('gdal_polygonize.py')
+  
+  old_wd <- getwd()
+  
+  setwd(outDir)
+  
+  pathTo_jsonFile <- paste0(tools::file_path_sans_ext(pathToRasFile), ".geojson")
+  
+  if (file.exists(pathTo_jsonFile)) file.remove(pathTo_jsonFile)
+  
+  system2('python3', args=(sprintf('"%1$s" "%2$s" -q -f "%3$s" "%4$s"',
+                                  pyPath, pathToRasFile, "GeoJSON", pathTo_jsonFile)))
+  
+  setwd(old_wd)
+  
+  return(NULL)
+}
+
+
+###############################################################################
+############################## Shiny app code #################################
+###############################################################################
 ui <- bootstrapPage(
   tags$style(type = "text/css", "html, body {width:100%;height:100%}"),
   tags$head(tags$style(HTML("
@@ -85,49 +659,66 @@ ui <- bootstrapPage(
                             margin-top: 0px !important;
                             -webkit-margin-after: 0px !important;
                             }
+                            .shiny-notification {background-color:#ff3e96;
+                            color:#000000;}
                             "))),
   leafletOutput("map", width = "78%", height = "100%"),
   absolutePanel(id = "controls", top = 10, right = 10, width = "20%",
-                img(src="Restore_and Renew_logo_green_275px_whiteBackground.png"),
-                selectInput("gdm_model",
-                            label= h4("GDM Model:"),
-                            choices=modelListDisplay
+                img(src = "Restore_and Renew_logo_green_275px_whiteBackground.png"),
+                absolutePanel(top = "90px", height = "20%", left = "1%", width = "90%",
+                              selectInput("gdm_model",
+                                          label = h4("GDM Model:"),
+                                          choices = modelListDisplay
+                              ),
+                              uiOutput("threshold"),
+                              actionButton("reset", "Reset", style = "color : #fff; background-color: #0095FF;") #,
+                              #actionButton("show3d", "Show 3D", style ="color : #fff; background-color : #FFB90F;")
                 ),
-                absolutePanel(top = "175px", height = "30%", left = "1%", width = "90%",
-                              #h4("Environmental variables:"),
-                              uiOutput("envVars")
-                ),
-                absolutePanel(top = "300px", height = "30%", left = "1%", width = "90%",
+                absolutePanel(top = "350px", height = "30%", left = "1%", width = "90%",
                               uiOutput("occRecords")
                 ),
-
-                absolutePanel(top = "450px", height = "30%", left = "1%", width = "90%",
-                              h4("Future climate scenario:"),
-                              radioButtons("rcpRadioGrp",
-                                           label=h5("RCP:"),
-                                           choices = list("rcp4.5" = 1,
-                                                          "rcp8.5" = 2),
-                                           selected = 1
-                              ),
-                              radioButtons("epochRadioGrp",
-                                           label=h5("Epoch:"),
-                                           choices = list("2050" = 1,
-                                                          "2070" = 2),
-                                           selected = 1)
+                absolutePanel(
+                  top = "500px",
+                  height = "30%",
+                  left = "1%",
+                  width = "90%",
+                  #h4("Environmental variables:"),
+                  uiOutput("envVars")
                 ),
-                absolutePanel(top = "750px", height = "10%", left = "1%", width = "90%",
+                
+                absolutePanel(top = "625px", height = "30%", left = "1%", width = "90%",
+                              h4("Future climate scenario:"),
+                              absolutePanel(#top = "590px", height = "5%", right = 2, width = "25%",
+                                radioButtons("rcpRadioGrp",
+                                             label=h5("RCP:"),
+                                             choices = list("rcp4.5" = 1,
+                                                            "rcp8.5" = 2),
+                                             selected = 1
+                                )),
+                              absolutePanel(left = "51%", #top = "590px", height = "5%", , width = "25%",
+                                            radioButtons("epochRadioGrp",
+                                                         label=h5("Time:"),
+                                                         choices = list("2050" = 1,
+                                                                        "2070" = 2),
+                                                         selected = 1))
+                ),
+                absolutePanel(top = "780px", height = "10%", left = "1%", width = "90%",
                               actionButton("help","Help", icon = icon("info-circle"), width = "110px", style = "color : #fff; background-color: #0095FF;"),
                               actionButton("addModel","Add model", icon = icon("info-circle"), width = "110px", style = "color : #fff; background-color: #0095FF;")
                 )
-  )
+  ) #,
+  #bsModal("show3dStuff", "", "show3d", size = "large", rglwidgetOutput("plotyplot"))
 )
 
 
-server <- function(input, output, session)
+###############################################################################
+server <- function(input,
+                   output,
+                   session)
 {
   # Reactive expression for the data subsetted to what the user selected
   futureParams <- reactive({
-
+    
     if (1 %in% input$rcpRadioGrp)
     {
       rcp <- "rcp45"
@@ -136,7 +727,7 @@ server <- function(input, output, session)
     {
       rcp <- "rcp85"
     }
-
+    
     if (1 %in% input$epochRadioGrp)
     {
       epoch <- "2050"
@@ -145,20 +736,24 @@ server <- function(input, output, session)
     {
       epoch <- "2070"
     }
-
+    
     return(list(rcp = rcp, epoch = epoch))
   })
-
-
-  #### A reactive component to nicely present the list of selected environmental variables
-  selectedEnvVars <- reactive({
-    #showNotification("BLAH CHECK BOX BLAH", duration = 10, id = "busyMsg", type = "error")
-    ans <- input$envVarsChkBox
-    #print(ans)
-    showNotification(paste(ans, collapse = ","), duration = 10, id = "busyMsg", type = "message")
-    return(paste(ans, collapse = ","))
+  
+  
+  ###############################################################################
+  getDefaultThreshold <- reactive({
+    if (input$gdm_model != "No model selected")
+    {
+      load(paste0(modelFolder, input$gdm_model))
+      return(md$threshold)
+    }
+    else
+      return(0)
   })
-
+  
+  
+  ###############################################################################
   # Set up map object
   output$map <- renderLeaflet({
     # Use leaflet() here, and only include aspects of the map that
@@ -166,13 +761,14 @@ server <- function(input, output, session)
     # entire map is being torn down and recreated).
     leaflet() %>%
       addProviderTiles("Esri.WorldStreetMap") %>%
-      fitBounds(140.5,-38,154,-27.5) %>%
-      #setView(lng = 150.45, lat = -33.66, zoom = 6) %>%
+      fitBounds(140.5, -38, 154, -27.5) %>%
       addLayersControl(overlayGroups = c("Environmental match", "Local Genetic Region", "Model domain", "Transition zones"),
                        options = layersControlOptions(autoZIndex = TRUE)) %>%
       addScaleBar("bottomleft")
   })
-
+  
+  
+  ###############################################################################
   # Mark clicked location with a bog-standard Leaflet map marker
   observe({
     click <- input$map_click
@@ -180,138 +776,151 @@ server <- function(input, output, session)
     {
       currPtLat <- click$lat
       currPtLong <- click$lon
-
+      
       proxy <- leafletProxy("map")
-
+      
       proxy %>%
         clearMarkers() %>%
         addMarkers(click$lng,click$lat)
     }
   })
-
+  
+  
+  ###############################################################################
   #### Reactive component to compute the current match layer
   currentClimate <- reactive(
     {
       click <- input$map_click
-      #showNotification(paste("Lat/long:", currPtLat, " ", currPtLong), duration = NULL, id = "busyMsg", type = "message")
-
+      ###RandR_currentSiteMatch(click$lng, click$lat, input$envVarsChkBox)
       RandR_currentSiteMatch(click$lng, click$lat, input$envVarsChkBox)
     })
-
-  #### Compute and display the Current environmental match layer for the selected location and set of env vars
+  
+  
+  ###############################################################################
+  #### Compute and display the Current environmental match layer for the
+  #### selected location and set of env vars
   observe({
     click <- input$map_click
     if (!is.null(click))
     {
-      showNotification("Computing Current environment match", duration = NULL, id = "busyMsg", type = "message")
-      #showNotification(paste("Lat/long:", click$lat, " ", click$lng), duration = NULL, id = "busyMsg", type = "message")
-
+      show_modal_spinner(spin = "flower", text = "Computing Current environment match", color = "#00BFFF")
+      
       proxy <- leafletProxy("map")
       proxy %>%
         removeGeoJSON("CC") %>%
         addGeoJSON(currentClimate(), layerId = "CC", color = layerPalette[2], group = "Environmental match")
-      removeNotification(id = "busyMsg")
+      remove_modal_spinner()
     }
   })
-
+  
+  
+  ###############################################################################
   # Compute and display the Future Climate match areas for the selected taxon
   observe({
     click <- input$map_click
     if (!is.null(click))
     {
-      showNotification("Computing Future environment match", duration = NULL, id = "busyMsg", type = "message")
-
+      show_modal_spinner(spin = "flower", text = "Computing Future environment match", color = "#FF8C00")
       futureBits <- futureParams()
-
+      
+      ###futureClimate <- RandR_futureSiteMatch(click$lng, click$lat, input$envVarsChkBox, futureBits$rcp, futureBits$epoch)
       futureClimate <- RandR_futureSiteMatch(click$lng, click$lat, input$envVarsChkBox, futureBits$rcp, futureBits$epoch)
-
+      
       proxy <- leafletProxy("map")
       proxy %>%
         removeGeoJSON("FC") %>%
         addGeoJSON(futureClimate, layerId = "FC", color = layerPalette[3], group = "Environmental match")
-
-      removeNotification(id = "busyMsg")
+      
+      remove_modal_spinner()
     }
   })
-
-
+  
+  
+  ###############################################################################
   # Conditionally compute and display the local genetic region for the selected taxon
   observe({
     click <- input$map_click
     if (!is.null(click))
     {
-      #showNotification("Computing Local Genetic region", duration = NULL, id = "busyMsg", type = "message")
-
-      proxy <- leafletProxy("map")
-
-      removeNotification(id = "badMsg")
-
       if (input$gdm_model != "No model selected")
       {
-        #print(input$gdm_model)
-        #boundsPoly <- readOGR(paste0(boundsFolder,"/",sub(" ","_",input$taxon),"_domain_clipped.geojson"))
-        #print(class(pp))
-        thisPt <- data.frame(x = click$lng, y = click$lat)
-        coordinates(thisPt) <- ~x + y
-        proj4string(thisPt) <- CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
-
-        if (!is.na(over(thisPt, boundsPoly)))
+        thisPt <- st_as_sf(data.frame(x = click$lng, y = click$lat), coords = c("x", "y"))
+        st_crs(thisPt) <- 4326
+        
+        if (nrow(st_intersection(thisPt, boundsPoly)) > 0)
         {
-          # print(modelFolder)
-          # print(input$gdm_model)
-          # print(taxonName())
-          # print(paste0(modelFolder, input$gdm_model))
-          showNotification("Computing Local Genetic region", duration = NULL, id = "busyMsg", type = "message")
-          gdmResult <- RandR_GDM_prediction(click$lng, click$lat, taxonName(), paste0(modelFolder, input$gdm_model), verbose = FALSE)
+          removeNotification(id = "badMsg")
+          show_modal_spinner(spin = "flower", text = "Computing Local Genetic Region", color = "#A9A9A9")
+          
+          gdmResult <- RandR_GDM_prediction(click$lng,
+                                            click$lat,
+                                            taxonName(),
+                                            paste0(modelFolder, input$gdm_model),
+                                            threshold = input$threshold,
+                                            verbose = FALSE)
+          leafletProxy("map") %>%
+            removeGeoJSON("GDM") %>%
+            addGeoJSON(gdmResult, layerId = "GDM", color = layerPalette[1], group = "Local Genetic Region") # %>%
+          
+          remove_modal_spinner()
+          enable("show2d")
         }
         else
         {
           gdmResult <- NULL
           showNotification("Out of bounds for selected taxon - try another location", duration = NULL, id = "badMsg", type = "error")
+          disable("show2d")
         }
       }
       else
         gdmResult <- NULL
-
-      proxy %>%
-        removeGeoJSON("GDM") %>%
-        addGeoJSON(gdmResult, layerId = "GDM", color = layerPalette[1], group = "Local Genetic Region") # %>%
-
-      removeNotification(id = "busyMsg")
     }
   })
-
-
+  
+  
+  ###############################################################################
   # Use a separate observer to recreate the legend as needed.
   observe({
     proxy <- leafletProxy("map")
-
+    
     # Remove any existing legend, and only if the legend is
     # enabled, create a new one.
     proxy %>%
       clearControls() %>%
       addLegend(position = "bottomright",
-                values = c(1,2,3,4,5),
+                values = c(1, 2, 3, 4, 5),
                 colors = layerPalette,
                 labels = c("Local genetic region", "Current env. match","Future env. match",
                            "Model domain", "Transition zones"))
   })
-
-
+  
+  
+  ###############################################################################
+  output$threshold <- renderUI({
+    sliderInput(inputId = "threshold",
+                label = h4("GDM threshold:"),
+                min = 0,
+                max = 1,
+                value = 0)
+  })
+  
+  
+  ###############################################################################
   output$envVars <- renderUI({
     tags$div(align = "left",
              class = "multicol",
              checkboxGroupInput("envVarsChkBox",
                                 label = h4("Environmental variables:"),
                                 choiceNames = c("Mean Ann. Temp.", "Mean Ann. Precip.",
-                                  "Temp. Seasonality", "Precip. Seasonality",
-                                  "Aspect", "Topo. Wetness Index"),
+                                                "Temp. Seasonality", "Precip. Seasonality",
+                                                "Aspect", "Topo. Wetness Index"),
                                 choiceValues = c("MAT", "MAP", "TS", "PS", "Aspect", "TWI"),
                                 selected = c("Mean Ann. Temp.", "Mean Ann. Precip."), width = "95%")
     )
   })
-
-
+  
+  
+  ###############################################################################
   output$occRecords <- renderUI({
     tags$div(align = "left",
              class = "multicol",
@@ -326,42 +935,39 @@ server <- function(input, output, session)
                                 selected = "") #c("R&R Samples", "Sent to DArT", "ALA herbarium"))),
     )
   })
-
-
+  
+  
+  ###############################################################################
   # Reactive expression to provide taxon name for the selected model
   taxonName <- reactive({
     return(trimws(sub(" genetic model.Rd", "", gsub("_", " ", input$gdm_model, fixed = TRUE), fixed = TRUE)))
   })
-
+  
+  ###############################################################################
   # Reactive expression for the data subsetted to what the user selected
   filteredData <- reactive({
-
     RandRdb <- dbConnect(SQLite(), sqlPath)
-
+    
     cleanedTaxonName <- gsub("D$|DQ$|DQK2$|DQK3$", "", taxonName())
     
     # Grab sample data from db here so it is independently available to DArT display option
-    sampleResults <- dbGetQuery(RandRdb, paste0('SELECT NSWnumber, decimalLongitude, decimalLatitude, dateToDArT FROM tissueSamples WHERE "scientificName" = "', cleanedTaxonName, '"
+    sampleResults <- RSQLite::dbGetQuery(RandRdb, paste0('SELECT NSWnumber, decimalLongitude, decimalLatitude, dateToDArT FROM tissueSamples WHERE "scientificName" = "', cleanedTaxonName, '"
                                                 OR "fieldSpeciesName" LIKE "', paste0(cleanedTaxonName, "%"), '" OR "otherSpeciesName" LIKE "', paste0(cleanedTaxonName, "%"), '";'))
-
-    #print(sampleResults)
-
+    
     if ("R&R Samples" %in% input$showCheckGrp)
     {
-      #sampleResults <- dbGetQuery(RandRdb, paste0('SELECT NSWnumber, decimalLongitude, decimalLatitude, dateToDArT FROM tissueSamples WHERE "scientificName" = "',input$infoTaxon,'"'))
-
       if (any(sampleResults$decimalLongitude == "No_data"))
       {
         sampleResults <- sampleResults[-which(sampleResults$decimalLongitude == "No_data"),]
       }
-
+      
       samplePts <- cbind(sampleResults[,c("NSWnumber", "decimalLongitude", "decimalLatitude")], ptType = rep(2, nrow(sampleResults)))
       colnames(samplePts) <- c("recordID", "longitude", "latitude", "ptType")
     } else
     {
       samplePts <- NULL
     }
-
+    
     if ("R&R Vouchers" %in% input$showCheckGrp)
     {
       voucherPts <- dbGetQuery(RandRdb, paste0('SELECT NSWnumber, decimalLongitude, decimalLatitude FROM voucherSamples WHERE "scientificName" = "',input$infoTaxon,'"'))
@@ -378,17 +984,15 @@ server <- function(input, output, session)
     {
       voucherPts <- NULL
     }
-
+    
     if (("DArT Samples" %in% input$showCheckGrp) && (nrow(sampleResults) > 0))
     {
       DArT_Ind <- which(sampleResults$dateToDArT != "No_data")
       if (length(DArT_Ind) > 0)
       {
-        #cat("length(DArT_Ind):", length(DArT_Ind), "\n")
         DArT_Pts <- sampleResults[DArT_Ind,]
-        #print(DArT_Pts)
-        #cat("nrow(DArT_Pts):", nrow(DArT_Pts), "\n")
         badRows <- which(DArT_Pts$decimalLongitude  == "No_data")
+        if (length(badRows) > 0) DArT_Pts <- DArT_Pts[-badRows, ]
         DArT_Pts$dateToDArT = rep(3, nrow(DArT_Pts))
         colnames(DArT_Pts) <- c("recordID", "longitude", "latitude", "ptType")
       }
@@ -401,13 +1005,10 @@ server <- function(input, output, session)
     {
       DArT_Pts <- NULL
     }
-
+    
     #cleanedTaxonName <- gsub("D$|DQ$|DQK2$|DQK3$", "", taxonName())
     thisFile <- paste0(basePathOcc, cleanedTaxonName, "/", sub(" ", "_", cleanedTaxonName), "_herbariumRecords.csv")
-
-    #print(thisFile)
-    # cat(file=stderr(), thisFile, "\n")
-
+    
     if (("ALA herbarium" %in% input$showCheckGrp) && (file.exists(thisFile)))
     {
       ALAspecimenPts <- read.csv(thisFile,
@@ -419,11 +1020,9 @@ server <- function(input, output, session)
     {
       ALAspecimenPts <- NULL
     }
-
-    #print(ALAspecimenPts)
-
+    
     surveyFilename <- paste0(basePathOcc, cleanedTaxonName, "/", sub(" ", "_", cleanedTaxonName), "_surveyRecords.csv")
-
+    
     if (("Survey records" %in% input$showCheckGrp) && (file.exists(surveyFilename)))
     {
       surveyPts <- read.csv(surveyFilename,
@@ -435,28 +1034,25 @@ server <- function(input, output, session)
     {
       surveyPts <- NULL
     }
-
+    
     tmp <- rbind(voucherPts, samplePts, DArT_Pts, ALAspecimenPts, surveyPts)
-
+    
     if (!is.null(tmp))
     {
       NArows <- which(is.na(tmp$longitude))
       if (length(NArows) > 0) tmp <- tmp[-NArows,]
     }
-
+    
     dbDisconnect(RandRdb)
-
+    
     tmp$latitude <- as.numeric(tmp$latitude)
     tmp$longitude <- as.numeric(tmp$longitude)
-    #tmp2 <<- tmp
-
-    #print(tmp)
-
+    
     return(tmp)
   })
-
-
-
+  
+  
+  ###############################################################################
   observe({
     df <- filteredData()
     sampleInd <- which(df$ptType == 2)
@@ -464,10 +1060,10 @@ server <- function(input, output, session)
     DArTind <- which(df$ptType == 3)
     voucherInd <- which(df$ptType == 1)
     surveyInd <- which(df$ptType == 5)
-
+    
     map <- leafletProxy("map", data = df)
     map %>% clearMarkers() # %>% clearMarkerClusters()
-
+    
     if (!is.null(df))
     {
       if (length(surveyInd) > 0)
@@ -477,13 +1073,13 @@ server <- function(input, output, session)
           iconWidth = 12, iconHeight = 20,
           iconAnchorX = 6, iconAnchorY = 18
         )
-
+        
         map %>% addMarkers(icon = surveyIcon,
                            options = markerOptions(clickable=FALSE),
                            #clusterOptions = markerClusterOptions(),
                            data=df[surveyInd,])
       }
-
+      
       if (length(ALAind) > 0)
       {
         alaIcon <- makeIcon(
@@ -491,13 +1087,13 @@ server <- function(input, output, session)
           iconWidth = 12, iconHeight = 20,
           iconAnchorX = 6, iconAnchorY = 18
         )
-
+        
         map %>% addMarkers(icon = alaIcon,
                            options = markerOptions(clickable=FALSE),
                            #clusterOptions = markerClusterOptions(),
                            data=df[ALAind,])
       }
-
+      
       if (length(sampleInd) > 0)
       {
         tissueIcon <- makeIcon(
@@ -505,13 +1101,13 @@ server <- function(input, output, session)
           iconWidth = 12, iconHeight = 20,
           iconAnchorX = 6, iconAnchorY = 18
         )
-
+        
         map %>% addMarkers(icon = tissueIcon,
                            options = markerOptions(clickable=FALSE),
                            #clusterOptions = markerClusterOptions(),
                            data = df[sampleInd,])
       }
-
+      
       if (length(voucherInd) > 0)
       {
         voucherIcon <- makeIcon(
@@ -519,13 +1115,13 @@ server <- function(input, output, session)
           iconWidth = 12, iconHeight = 20,
           iconAnchorX = 6, iconAnchorY = 18
         )
-
+        
         map %>% addMarkers(icon = voucherIcon,
                            options = markerOptions(clickable=FALSE),
                            #clusterOptions = markerClusterOptions(),
                            data = df[voucherInd,])
       }
-
+      
       if (length(DArTind) > 0)
       {
         dartIcon <- makeIcon(
@@ -533,7 +1129,7 @@ server <- function(input, output, session)
           iconWidth = 12, iconHeight = 20,
           iconAnchorX = 6, iconAnchorY = 18
         )
-
+        
         map %>% addMarkers(icon = dartIcon,
                            options = markerOptions(clickable=FALSE),
                            #clusterOptions = markerClusterOptions(),
@@ -546,12 +1142,83 @@ server <- function(input, output, session)
     if (!is.null(click))
     {
       currPtLat <- click$lat
-      currPtLong <- click$lon
-      map %>% addMarkers(click$lng,click$lat)
+      currPtLong <- click$lng
+      map %>% addMarkers(click$lng, click$lat)
     }
   })
+  
+  
+  ###############################################################################
+#   output$plotyplot <- renderRglwidget({
+#     clear3d()
+#     
+#     click <- input$map_click
+#     testPt <- c(click$lng, click$lat)
+#     cat(taxonName(), "   ", click$lon, "   ", click$lat, "\n")
+# 
+#     rasPath <- RandR_GDM_prediction_raw(testPt[1],
+#                                         testPt[2],
+#                                         taxonName(),
+#                                         modelFolder = modelFolder,
+#                                         outputFolder = "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/GDM_3D_trials",
+#                                         verbose = FALSE)
+#     # 
+#     # #cat(rasPath, "\n")
+#     # 
+#     gdmRas <- raster(rasPath)
+#     # 
+#     # #cat("gdmRas created\n")
+#     # 
+#     outputRas <- baseRas
+#     # 
+#     # #cat("nrow(baseRas) =", nrow(baseRas), "\n")
+#     outputRas[!is.na(outputRas[])] <- 0.0
+#     # 
+#     outputRas[!is.na(gdmRas)] <- gdmRas[!is.na(gdmRas)]
+#     #cat("outputRas set\n")
+#     
+#     # Based on extract from plot3D() in rasterVis
+#     sampledRas <- sampleRegular(outputRas, size=2.5e5, asRaster=TRUE)
+#     X <- xFromCol(sampledRas, 1:ncol(sampledRas))
+#     Y <- yFromRow(sampledRas, nrow(sampledRas):1)
+#     Z <- t((getValues(sampledRas, format='matrix'))[nrow(sampledRas):1,])
+#     
+#     background <- min(Z, na.rm=TRUE) - 0.1
+#     Z[is.na(Z)] <- background
+#     
+#     
+# #    cat("about to plot\n")
+#     
+#     persp3d(x = X,
+#            y = Y,
+#            z = Z,
+#            col = terrain.colors(32),
+#            aspect = FALSE,
+#            xlim = c(140, 154))
+#     
+#     # points3d(x = testPt[1], y = testPt[2], z = 1)
+#     #cat("at axes3d\n")
+#     axes3d()
+#     #title3d(main = taxonName(), xlab = "Longitude", ylab = "Latitude")
+#     segments3d(x = c(testPt[1], testPt[1]),
+#                y = c(testPt[2], testPt[2]),
+#                z = c(0, 1),
+#                col = "orange")
+# 
+#     pch3d(x = testPt[1],
+#           y = testPt[2],
+#           z = 1,
+#           pch = 16,
+#           cex = 4,
+#           radius = 0.25,
+#           col = "orange")
+#     
+#       rglwidget()       #  (minimal = FALSE, width = 750, height = 500)
+#       
+#     })
+  
 
-
+  ###############################################################################
   # Show general help dialog
   observeEvent(input$help,{showModal(modalDialog(div(img(src="Restore_and Renew_logo_green_275px_whiteBackground.png", style="float:right;"),
                                                      h2("Using the app"), style = "height:80px;"),
@@ -563,49 +1230,54 @@ server <- function(input, output, session)
                                                      p(strong("Requirements:")," This app requires the ",em("R"),"-package ",em("RandR.modelReview"),", a modified version of the ",em("R"),"-package ",em("RandR.webtool"),". It is available on the N-drive at 'Evolutionary Ecology/Restore & Renew/RandR.modelReview'. It also requires the following ", em("R"),"-packages: ", em("shiny, leaflet, rgdal,")," and ",em("raster"),".")),
                                                  size = "m"
   ))})
-
-
+  
+  
+  ###############################################################################
   # Show a model dialog giving information on adding a new models,
   observeEvent(input$addModel,{showModal(modalDialog(div(img(src="Restore_and Renew_logo_green_275px_whiteBackground.png", style="float:right;"),
                                                          h2("Adding a new model"), style = "height:80px;"),
                                                      div(p(),
                                                          p(strong("File names:")," Convention is 'Genus_specificEpithet_' followed by either 'domain.geojson' or 'genetic_model.Rd'. Model names are added to the pull-down list at app start-up by listing the file names found in the 'model' folder. If you wish to compare competing models for species, then add an identifier to the specificEpithet part of the file name. For example, 'Acacia_suaveolens' and 'Acacia_suaveolensNoElev'."),
-                                                         p(strong("File locations:")," Domain files are placed in www/models/domain. GDM model objects are placed in www/models/gdm."),
+                                                         p(strong("File locations:"), " All data and models live in the 'www' folder below the folder in which you placed a copy of the app. Domain files are placed in 'www/models/domain'. GDM model objects are placed in 'www/models/gdm', and Q covariate rasters are placed in www/models/qData/eastOZ''."),
                                                          p(strong("Preparatory tasks:")," To perform an 'in-bounds' check for a clicked location, a clipped version of the model bounds geoJSON file must be prepared using the R-script in the file 'clipDomainPolygon.R'"),
-                                                         p("If a GDM uses Q covariates, the tif files must be placed in the folder '/home/RandR/qData/eastOZ' and the function ", em("setModelCovars()")," run to setup the covariate paths in the model object."),
-                                                         p(strong("Requirements:")," This app requires the ",em("R"),"-package ",em("RandR.modelReview"),", a modified version of the ",em("R"),"-package ",em("RandR.webtool"),". It is available on the N-drive at 'Evolutionary Ecology/Restore & Renew/RandR.modelReview'. It also requires the following ", em("R"),"-packages: ", em("shiny, leaflet, rgdal,")," and ",em("raster"),".")),
+                                                         p("If a GDM uses Q covariates, the tif files must be placed in the folder '/www/qData/eastOZ' and the function ", em("setModelCovars()")," the ", em("R"),"-package RandR.webtool.dataPrep run to setup the covariate paths in the model object."),
+                                                         p(strong("Requirements:")," This Shiny app requires the following ", em("R"), "-packages: ", em("shiny"), ", ", em("shinybusy"), ", ", em("shinyjs"), ", ", em("shinyBS"), ", ", em("leaflet"), ", ", em("sf"), ", ", em("raster"), ", ", em("jsonlite"), " and ", em("gdm"))),
                                                      size = "m"
   ))})
-
+  
+  
+  ###############################################################################
+  # Reset GDM threshold to the default value stored in the GDM object
+  observeEvent(input$reset,
+               {
+                 updateSliderInput(session, inputId = "threshold", value = getDefaultThreshold())
+               })
+  
+  
+  ###############################################################################
   # Load the clipped bounds polygon when a species changes; also load a transition zone layer if it exists
   observe({
-
     if (input$gdm_model != "No model selected")
     {
-      #print("Loading boundsPoly")
-      #print(paste0(boundsFolder,"/",taxon_Name[input$gdm_model],"_domain_clipped.geojson"))
-      # As an spatial polygon object for testing if vclicked location is inside the model domain
+      # As an spatial polygon object for testing if clicked location is inside the model domain
       boundsPolyName <- paste0(boundsFolder,"/", sub(" ", "_", taxonName(), fixed = TRUE), "_domain_clipped.geojson")
-      #print(boundsPolyName)
-      boundsPoly <<- readOGR(boundsPolyName, verbose = FALSE)
-      #print(class(boundsPoly))
-
+      boundsPoly <<- st_read(boundsPolyName)
+      st_crs(boundsPoly) <- 4326
       boundsPoly_json <- jsonlite::toJSON(jsonlite::fromJSON(txt = boundsPolyName), auto_unbox = TRUE)
-      #print(class(boundsPoly_json))
-
+      
+      # Show the selected model default threshold in the threshold slider:
+      updateSliderInput(session, inputId = "threshold", value = getDefaultThreshold())
+      
       proxy <- leafletProxy("map")
       proxy %>%
         removeGeoJSON("Domain") %>%
         removeGeoJSON("Zones") %>%
         addGeoJSON(boundsPoly_json, layerId = "Domain", color = layerPalette[4], group = "Model domain")
-
-      #print("Added bounds polygon geojson")
-
+      
       # Identify and load any transition zone files for the selected model
-
       theseFileInd <- grep(sub(" ", "_", taxonName(), fixed = TRUE), zonesList)
       #print(theseFileInd)
-
+      
       if (length(theseFileInd) > 0)
       {
         for (i in theseFileInd)
@@ -618,12 +1290,21 @@ server <- function(input, output, session)
       }
     }
     else
+    {
       boundsPoly <<- NULL
-
+      proxy <- leafletProxy("map")
+      proxy %>%
+        removeGeoJSON("Domain") %>%
+        removeGeoJSON("Zones") %>%
+        clearMarkers() %>%
+        removeGeoJSON("GDM")
+      ##### Set theshold to 0
+      updateSliderInput(session, inputId = "threshold", value = 0)
+    }
   })
 }
 
 
-#
+###############################################################################
 shinyApp(ui, server, options = list(launch.browser = TRUE))
 

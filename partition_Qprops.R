@@ -47,7 +47,7 @@ for (thisFile in theFiles)
   
   if (file.exists(pathTo_jsonFile)) file.remove(pathTo_jsonFile)
   
-  system2('python', args=(sprintf('"%1$s" "%2$s" -q -f "%3$s" "%4$s"',
+  system2('python3', args=(sprintf('"%1$s" "%2$s" -q -f "%3$s" "%4$s"',
                                   pyPath, zoneFileName, "GeoJSON", pathTo_jsonFile)))
   
   setwd(old_wd)
