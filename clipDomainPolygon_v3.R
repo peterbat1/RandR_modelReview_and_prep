@@ -54,17 +54,19 @@ model_files <- list.files("/home/peterw/Data_and_Projects/RBG Projects/Restore a
 #this_model <- "/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/models/gdm/Hakea_sericea_genetic_model.Rd"
 for (this_model in model_files)
 {
-  load(this_model)
-  rawDomain <- sf::st_as_sf(md$confidence_polygon)
-  #rawDomain <- st_read("/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/models/domain/Acacia_longifolia_domain.geojson")
+  domain_name <- gsub("_genetic_model.Rd", "_domain.geojson", basename(this_model), fixed = TRUE)
+  ##load(this_model)
+  ###rawDomain <- sf::st_as_sf(md$confidence_polygon)
+  
+  rawDomain <- sf::st_read(paste0("/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/RandR_modelReview_and_prep/www/models/domain/", domain_name))
   #rawDomain <- sf::st_transform(rawDomain, 4326)
   sf::st_crs(rawDomain) <- 4326
   
-  sf::st_write(rawDomain,
-               dsn = paste0("/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/Webtool_new_dataset/domain/",
-                            gsub("genetic_model.Rd", "domain.geojson", basename(this_model), fixed = TRUE)),
-               driver = "GeoJSON",
-               append = FALSE)
+  # sf::st_write(rawDomain,
+  #              dsn = paste0("/home/peterw/Data_and_Projects/RBG Projects/Restore and Renew/RandR_webtool_dev/Webtool_new_dataset/domain/", domain_name),
+  #                           #gsub("genetic_model.Rd", "domain.geojson", basename(this_model), fixed = TRUE)),
+  #              driver = "GeoJSON",
+  #              append = FALSE)
   
   clippedDomain <- sf::st_union(sf::st_intersection(rawDomain, ozPolygon))
   
